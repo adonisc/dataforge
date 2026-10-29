@@ -1,0 +1,16 @@
+
+# Framework: a bug here affects every data product.
+/src/dataforge/            @data-platform
+
+# Contracts: each data product's privacy and quality rules.
+/contracts/                @data-platform @data-governance
+
+# Masking and the compatibility check: a bad merge here is a compliance issue.
+/src/dataforge/privacy/            @data-platform @security
+/src/dataforge/contracts/compatibility.py  @data-platform @data-governance
+
+# Delivery: what reaches production and how.
+/.github/workflows/        @data-platform @platform-security
+
+# Business logic: owned by whoever owns the definitions.
+/transform/dbt/models/marts/   @analytics-engineering

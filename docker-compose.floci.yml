@@ -1,0 +1,81 @@
+# Floci overlay: runs the pipeline against emulated AWS instead of local disk.
+#
+# Floci (https://floci.io) emulates AWS on :4566. Used here: S3 (lake and landing),
+# Secrets Manager (masking key, FX token) and optionally Glue.
+#
+# Usage
+# -----
+#   Floci alone, driving the pipeline from the host CLI:
+#       docker compose -f docker-compose.floci.yml up -d floci
+#
+#   Floci plus the full Airflow 3 stack, with the DAGs writing to emulated S3:
+#       docker compose -f docker-compose.yml -f docker-compose.floci.yml up -d
+#
+# This file only adds env vars, so the base file still works on its own. No code knows
+# about the emulator; AWS_ENDPOINT_URL is all it takes.
+
+x-aws-env: &aws-env
+  # Inside the network it's floci:4566; from the host it's localhost:4566.
+  AWS_ENDPOINT_URL: http://floci:4566
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_REGION: us-east-1
+
+  # Point the lake and the landing zone at emulated S3.
+  DATAFORGE_LAKE_ROOT: s3://dataforge-lake/warehouse
+  DATAFORGE_LANDING_ROOT: s3://dataforge-landing
+
+  # Masking key comes from Secrets Manager, like prod. The literal is blank on purpose.
+  DATAFORGE_MASKING_KEY_SECRET_REF: secret://dataforge/masking-key
+  DATAFORGE_MASKING_KEY: ""
+
+services:
+  floci:
+    image: floci/floci:latest
+    ports:
+      - "4566:4566"
+    environment:
+      # Keeps state across restarts without writing on every call.
+      FLOCI_STORAGE_MODE: hybrid
+      FLOCI_DEFAULT_REGION: us-east-1
+      # So URLs Floci returns resolve from other containers.
+      FLOCI_HOSTNAME: floci
+    volumes:
+      - floci-data:/app/data
+      # Only needed for Lambda/ECS/RDS emulation. Safe to remove for S3 and secrets.
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      # Floci serves the LocalStack health path for compatibility.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # --- the Airflow services, with AWS wired in ------------------------------------
+  # Listed per service; Compose merges these into the base file's environment.
+
+  airflow-init:
+    environment: *aws-env
+    depends_on:
+      floci:
+        condition: service_healthy
+
+  api-server:
+    environment: *aws-env
+
+  scheduler:
+    environment: *aws-env
+    depends_on:
+      floci:
+        condition: service_healthy
+
+  dag-processor:
+    environment: *aws-env
+
+  triggerer:
+    environment: *aws-env
+
+volumes:
+  floci-data:

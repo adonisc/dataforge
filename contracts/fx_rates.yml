@@ -1,0 +1,113 @@
+apiVersion: dataforge/v1
+kind: DataContract
+
+metadata:
+  name: fx_rates
+  domain: finance
+  owner: finance-data@acme.example
+  upstream_system: "Treasury FX REST API (paginated, bearer token)"
+  description: >-
+    Daily FX rates to USD. Small, but every gold revenue figure is converted through
+    it, so almost all of its rules are blocking.
+  version: 1.0.0
+  tags: [finance, reference-data, tier-1]
+
+spec:
+  source:
+    type: rest_api
+    mode: incremental
+    uri: "https://treasury.internal.acme.example/v1/fx/rates?date={logical_date}"
+    # A reference to the secret, resolved at task start.
+    secret_ref: "secret://platform/fx-api/readonly"
+    watermark_field: rate_date
+    options:
+      records_path: data
+      page_param: page
+      page_size: 500
+      max_pages: 10
+      since_param: updated_since
+
+  targets:
+    bronze: bronze.fx_rates_raw
+    silver: silver.fx_rates
+    quarantine: quarantine.fx_rates
+
+  schema:
+    primary_key: [rate_date, currency_code]
+    dedupe_order_by: [retrieved_at]
+    fields:
+      - name: rate_date
+        type: date
+        required: true
+      - name: currency_code
+        type: string
+        required: true
+      - name: rate_to_usd
+        type: decimal
+        precision: 18
+        scale: 8
+        required: true
+        description: 8 decimal places — minor currencies need the precision.
+      - name: retrieved_at
+        type: timestamp
+        required: true
+
+  quality:
+    # Zero tolerance: one bad rate skews all converted revenue.
+    max_quarantine_rate: 0.0
+    rules:
+      - id: fx_complete
+        type: not_null
+        columns: [rate_date, currency_code, rate_to_usd, retrieved_at]
+        severity: blocking
+      - id: fx_unique
+        type: unique
+        columns: [rate_date, currency_code]
+        severity: blocking
+        params:
+          order_by: [retrieved_at]
+      - id: fx_iso
+        type: regex
+        columns: [currency_code]
+        severity: blocking
+        params:
+          pattern: "[A-Z]{3}"
+      - id: fx_rate_positive
+        type: range
+        columns: [rate_to_usd]
+        severity: blocking
+        params:
+          min: 0.000001
+          max: 100000
+      - id: fx_date_valid
+        type: timestamp_valid
+        columns: [rate_date, retrieved_at]
+        severity: blocking
+        params:
+          max_future_skew_minutes: 1440
+          not_before: "2015-01-01T00:00:00"
+      - id: fx_currency_coverage
+        type: row_count_anomaly
+        severity: blocking
+        params:
+          min_rows: 5
+        description: >-
+          The business trades in at least five currencies. Fewer rows means a partial API
+          response, which would produce wrong revenue numbers.
+
+  partitioning:
+    column: rate_date
+    granularity: day
+    target_file_size_mb: 16
+
+  retention:
+    bronze_days: 3650
+    silver_days: 3650
+    quarantine_days: 365
+
+  slo:
+    freshness_minutes: 1440
+    completeness_target: 1.0
+
+  evolution:
+    compatibility: full

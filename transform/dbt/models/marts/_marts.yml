@@ -1,0 +1,170 @@
+version: 2
+
+models:
+  - name: dim_customer
+    description: >-
+      Type 2 customer dimension. One row per customer per attribute version. Join facts
+      on `customer_key`, or on `customer_id` with a `between valid_from and valid_to`
+      predicate for point-in-time correctness.
+    config:
+      contract:
+        # Enforce the output schema at build time, so upstream changes fail the build.
+        enforced: true
+    columns:
+      - name: customer_key
+        description: Surrogate key — hash of (customer_id, valid_from). Reproducible across rebuilds.
+        data_type: varchar
+        constraints: [{ type: not_null }]
+        data_tests: [unique]
+      - name: customer_id
+        data_type: varchar
+        constraints: [{ type: not_null }]
+      - name: email_token
+        description: HMAC token. Joinable, not reversible. Do not attempt to un-mask.
+        data_type: varchar
+      - name: email_domain
+        data_type: varchar
+      - name: full_name
+        data_type: varchar
+      - name: phone_last4
+        data_type: varchar
+      - name: country_code
+        data_type: varchar
+        data_tests:
+          - not_null
+          - dbt_utils.not_accepted_values: { values: ['', 'NULL', 'N/A'] }
+      - name: customer_segment
+        data_type: varchar
+        data_tests:
+          - accepted_values:
+              values: [consumer, smb, enterprise, unknown]
+      - name: signup_ts
+        data_type: timestamp with time zone
+      - name: is_deleted
+        data_type: boolean
+        constraints: [{ type: not_null }]
+      - name: attribute_hash
+        data_type: varchar
+      - name: valid_from
+        data_type: timestamp with time zone
+        constraints: [{ type: not_null }]
+      - name: valid_to
+        data_type: timestamp with time zone
+        constraints: [{ type: not_null }]
+      - name: is_current
+        data_type: boolean
+
+    data_tests:
+      # Exactly one current version per customer.
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [customer_id, valid_from]
+      - scd2_no_overlapping_versions:
+          key_column: customer_id
+
+  - name: fct_orders
+    description: >-
+      Transaction-grain order fact. One row per order. Revenue in both the transaction
+      currency and USD; convert here, never in the BI layer.
+    config:
+      contract: { enforced: true }
+    columns:
+      - name: order_key
+        data_type: varchar
+        constraints: [{ type: not_null }]
+        data_tests: [unique]
+      - name: order_id
+        data_type: varchar
+        constraints: [{ type: not_null }]
+        data_tests: [unique]
+      - name: customer_key
+        data_type: varchar
+        data_tests:
+          - relationships:
+              to: ref('dim_customer')
+              field: customer_key
+              config:
+                # Warn only: a new customer can show up in orders before the CDC feed.
+                severity: warn
+      - name: customer_id
+        data_type: varchar
+        constraints: [{ type: not_null }]
+      - name: customer_email_token
+        data_type: varchar
+      - name: order_status
+        data_type: varchar
+        data_tests:
+          - accepted_values:
+              values: [placed, paid, shipped, delivered, cancelled, refunded]
+      - name: channel
+        data_type: varchar
+      - name: currency_code
+        data_type: varchar
+        constraints: [{ type: not_null }]
+      - name: promo_code
+        data_type: varchar
+      - name: gross_amount
+        data_type: decimal(18,2)
+        constraints: [{ type: not_null }]
+        data_tests:
+          - dbt_utils.accepted_range: { min_value: 0, inclusive: true }
+      - name: discount_amount
+        data_type: decimal(18,2)
+      - name: net_amount
+        data_type: decimal(18,2)
+        constraints: [{ type: not_null }]
+      - name: net_amount_usd
+        data_type: decimal(18,2)
+      - name: rate_to_usd
+        data_type: decimal(18,8)
+      - name: order_ts
+        data_type: timestamp with time zone
+        constraints: [{ type: not_null }]
+      - name: order_date
+        data_type: date
+        constraints: [{ type: not_null }]
+      - name: updated_at
+        data_type: timestamp with time zone
+      - name: has_missing_fx_rate
+        data_type: boolean
+      - name: has_unmatched_customer
+        data_type: boolean
+      - name: _run_id
+        data_type: varchar
+      - name: _contract_version
+        data_type: varchar
+      - name: _built_at
+        data_type: timestamp with time zone
+
+    data_tests:
+      # Model-level test over the whole table. It checks this stays rare, not that it never happens.
+      - expression_is_true:
+          expression: "count(case when has_missing_fx_rate then 1 end) * 1.0 / nullif(count(*), 0) < 0.01"
+          config:
+            severity: error
+
+  - name: agg_revenue_daily
+    description: >-
+      Daily revenue by channel and currency. The table behind the executive dashboard.
+      Pre-aggregated because the read:write ratio justifies it.
+    columns:
+      - name: revenue_date
+        data_tests: [not_null]
+      - name: channel
+      - name: currency_code
+      - name: net_amount_usd
+        data_tests:
+          - not_null
+      - name: order_count
+        data_tests:
+          - dbt_utils.accepted_range: { min_value: 0, inclusive: true }
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [revenue_date, channel, currency_code]
+      # Totals must match the fact table.
+      - aggregate_reconciles_to_fact:
+          fact_model: fct_orders
+          fact_measure: net_amount_usd
+          agg_measure: net_amount_usd
+          grain_column: order_date
+          agg_grain_column: revenue_date
+          tolerance: 0.01

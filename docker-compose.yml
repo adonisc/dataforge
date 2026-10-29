@@ -1,0 +1,172 @@
+# Local Airflow 3 stack for development. Not a production setup; see the notes at the
+# bottom of this file and docs/04.
+#
+#   api-server     — UI and REST / Task Execution APIs
+#   scheduler      — scheduling and backfills
+#   dag-processor  — parses DAG files, so the scheduler never imports user code
+#   triggerer      — deferrable operators
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  image: dataforge-airflow:local
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    # Overridable from .env. Postgres isn't exposed to the host anyway.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-local-dev-jwt-secret-change-me}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+
+    # SimpleAuthManager with all_admins=True: no login, fine for localhost only.
+    # Never use this in a shared environment; use a real auth manager with SSO.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"
+    # Set explicitly rather than relying on the default.
+    AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: "false"
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+
+    # --- dataforge configuration ---------------------------------------------------
+    DATAFORGE_ENV: dev
+    DATAFORGE_CONTRACTS: /opt/airflow/contracts
+    DATAFORGE_LAKE_ROOT: /opt/airflow/data/lake
+    DATAFORGE_LANDING_ROOT: /opt/airflow/data/landing
+    DATAFORGE_STATE_PATH: /opt/airflow/data/_control/state.json
+    DATAFORGE_LINEAGE_PATH: /opt/airflow/data/_control/lineage.jsonl
+    # Local only. Deployed environments get this from the secrets backend.
+    DATAFORGE_MASKING_KEY: ${DATAFORGE_MASKING_KEY:-local-dev-key-not-a-secret}
+    DATAFORGE_MASKING_KEY_VERSION: v1
+
+    # Airflow emits task lineage, dataforge emits dataset lineage; same collector.
+    AIRFLOW__OPENLINEAGE__TRANSPORT: '{"type": "http", "url": "http://marquez:5000"}'
+    AIRFLOW__OPENLINEAGE__NAMESPACE: dataforge-dev
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./contracts:/opt/airflow/contracts:ro        # read-only
+    - ./transform:/opt/airflow/transform
+    - ./data:/opt/airflow/data
+    - ./src:/opt/airflow/src
+  user: "50000:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-airflow}"]
+      interval: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        # Airflow runs as uid 50000, so create the data dirs with group write up front.
+        mkdir -p /opt/airflow/data/_control /opt/airflow/data/lake /opt/airflow/data/landing
+        chmod -R g+rwX /opt/airflow/data || true
+        airflow db migrate
+        airflow version
+    restart: on-failure
+
+  api-server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Local lineage collector, to see the lineage graph for your changes.
+  marquez:
+    image: marquezproject/marquez:0.49.0
+    ports:
+      - "5000:5000"
+      - "3000:3000"
+    environment:
+      MARQUEZ_CONFIG: /usr/src/app/marquez.dev.yml
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["lineage"]   # opt-in: `docker compose --profile lineage up`
+
+  # ------------------------------------------------------------------------------
+  # tools — one-shot runner for data generation, the pipeline, tests, dbt and cloud
+  # checks. Only Docker is needed on the host. Same image as Airflow; doesn't wait on
+  # Postgres.
+  #
+  #   docker compose run --rm tools "<any shell command>"
+  # ------------------------------------------------------------------------------
+  tools:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    image: dataforge-airflow:local
+    profiles: ["tools"]
+    working_dir: /work
+    volumes:
+      - .:/work
+    environment:
+      PYTHONPATH: /work/src:/work
+      DATAFORGE_ENV: dev
+      DATAFORGE_CONTRACTS: /work/contracts
+      DATAFORGE_LAKE_ROOT: /work/data/lake
+      DATAFORGE_LANDING_ROOT: /work/data/landing
+      DATAFORGE_STATE_PATH: /work/data/_control/state.json
+      DATAFORGE_LINEAGE_PATH: /work/data/_control/lineage.jsonl
+      DATAFORGE_MASKING_KEY: ${DATAFORGE_MASKING_KEY:-local-dev-key-not-a-secret}
+      DBT_PROFILES_DIR: /work/transform/dbt
+    entrypoint: ["/bin/bash", "-lc"]
+    command: ["echo 'usage: docker compose run --rm tools \"<command>\"'"]
+
+volumes:
+  postgres-data:
+
+# ----------------------------------------------------------------------------------
+# How production differs
+# ----------------------------------------------------------------------------------
+#  * Executor: Kubernetes or Celery, not Local.
+#  * DAGs: a Git DAG bundle, so re-runs use the code version they first ran with.
+#  * Metadata DB: managed Postgres with backups.
+#  * Secrets: a secrets backend, never env vars in a compose file.
+#  * Auth: a real auth manager with SSO and RBAC.
+#  * Storage: S3 with an Iceberg REST catalog.

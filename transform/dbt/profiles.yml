@@ -1,0 +1,28 @@
+# Each target uses its own database, so a dev run can't write to prod.
+dataforge:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "../../data/warehouse/dev.duckdb"
+      schema: main
+      threads: 4
+      # No `extensions:`. Parquet is built in; listing it triggers a download.
+    test:
+      type: duckdb
+      path: "../../data/warehouse/test.duckdb"
+      schema: main
+      threads: 4
+    prod:
+      # Credentials come from env vars, never this file.
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      authenticator: oauth
+      token: "{{ env_var('SNOWFLAKE_OAUTH_TOKEN') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'TRANSFORMER_PROD') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'WH_TRANSFORM_PROD') }}"
+      database: ANALYTICS_PROD
+      schema: marts
+      threads: 8
+      query_tag: "dbt|{{ env_var('GIT_SHA', 'local') }}"

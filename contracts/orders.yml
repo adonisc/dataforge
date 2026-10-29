@@ -1,0 +1,189 @@
+apiVersion: dataforge/v1
+kind: DataContract
+
+metadata:
+  name: orders
+  domain: commerce
+  owner: commerce-data@acme.example
+  upstream_system: "OMS (Order Management System) nightly extract"
+  description: >-
+    Order headers from the order management system. One row per order, current state.
+    Order lines would be a separate contract.
+  version: 1.2.0
+  tags: [commerce, revenue, tier-1]
+
+spec:
+  source:
+    type: filesystem
+    mode: incremental
+    format: jsonl
+    # Read by logical date, so a backfill reads exactly that day's files.
+    uri: "orders/dt={logical_date}/*.jsonl"
+    watermark_field: updated_at
+    # Orders can be re-sent up to 3 days later (payment capture, refunds).
+    late_arrival_window_days: 3
+
+  targets:
+    bronze: bronze.orders_raw
+    silver: silver.orders
+    quarantine: quarantine.orders
+
+  schema:
+    primary_key: [order_id]
+    # Latest updated_at wins; _ingested_at breaks ties.
+    dedupe_order_by: [updated_at, _ingested_at]
+    fields:
+      - name: order_id
+        type: string
+        required: true
+        description: Natural key from the OMS.
+      - name: customer_id
+        type: string
+        required: true
+        description: FK to silver.customers.
+      - name: customer_email
+        type: string
+        classification: pii
+        masking: hash_hmac
+        description: >-
+          Tokenised in silver. The raw value is only in bronze (90-day retention,
+          restricted access).
+      - name: order_status
+        type: string
+        required: true
+      - name: channel
+        type: string
+        required: true
+      - name: currency_code
+        type: string
+        required: true
+      - name: gross_amount
+        type: decimal
+        precision: 18
+        scale: 2
+        required: true
+        description: >-
+          DECIMAL, never FLOAT, so sums don't drift.
+      - name: discount_amount
+        type: decimal
+        precision: 18
+        scale: 2
+      - name: order_ts
+        type: timestamp
+        required: true
+        description: When the order was placed (source timezone normalised to UTC).
+      - name: updated_at
+        type: timestamp
+        required: true
+        description: Source change timestamp; drives the incremental watermark.
+      - name: order_date
+        type: date
+        required: true
+        description: Partition column, derived upstream from order_ts in source timezone.
+      - name: promo_code
+        type: string
+        description: Added in contract v1.2.0 as an optional field (backward compatible).
+
+  quality:
+    # Above 2% the batch is probably broken, not just dirty, so block it.
+    max_quarantine_rate: 0.02
+    rules:
+      - id: orders_pk_not_null
+        type: not_null
+        columns: [order_id, customer_id, order_status, gross_amount, order_ts, order_date]
+        severity: blocking
+        description: A null primary key or amount means the extract itself is broken.
+
+      - id: orders_pk_unique
+        type: unique
+        columns: [order_id]
+        severity: quarantine
+        params:
+          order_by: [updated_at, _ingested_at]
+        description: Supersede older duplicates rather than failing; redelivery is normal.
+
+      - id: orders_status_known
+        type: accepted_values
+        columns: [order_status]
+        severity: quarantine
+        params:
+          case_insensitive: true
+          values: [placed, paid, shipped, delivered, cancelled, refunded]
+        description: >-
+          A new status needs a decision before it can count toward revenue.
+
+      - id: orders_channel_known
+        type: accepted_values
+        columns: [channel]
+        severity: warn
+        params:
+          values: [web, ios, android, marketplace, retail, phone]
+        description: Warn only — a new channel is additive and harmless to revenue sums.
+
+      - id: orders_currency_iso
+        type: regex
+        columns: [currency_code]
+        severity: quarantine
+        params:
+          pattern: "[A-Z]{3}"
+
+      - id: orders_amount_sane
+        type: range
+        columns: [gross_amount]
+        severity: quarantine
+        params:
+          min: 0
+          max: 1000000
+        description: Negative gross belongs in a refund record, not an order header.
+
+      - id: orders_ts_valid
+        type: timestamp_valid
+        columns: [order_ts, updated_at]
+        severity: blocking
+        params:
+          max_future_skew_minutes: 60
+          not_before: "2015-01-01T00:00:00"
+        description: >-
+          Blocking: a future-dated updated_at would push the watermark ahead and stop
+          later runs from picking up data.
+
+      - id: orders_volume
+        type: row_count_anomaly
+        severity: blocking
+        params:
+          min_rows: 1
+          drop_threshold: 0.5
+        description: >-
+          A half-empty extract usually means a truncated upload. Blocking, so revenue
+          isn't under-reported.
+
+      - id: orders_freshness
+        type: freshness
+        columns: [updated_at]
+        severity: warn
+        params:
+          max_age_minutes: 1500
+        description: >-
+          Warn here; the external freshness monitor does the paging, since a pipeline
+          that doesn't run can't report itself.
+
+  partitioning:
+    column: order_date
+    granularity: day
+    cluster_by: [channel, order_status]
+    target_file_size_mb: 256
+
+  retention:
+    bronze_days: 90
+    silver_days: 2555
+    quarantine_days: 30
+
+  slo:
+    freshness_minutes: 1440
+    expected_min_rows_per_run: 1
+    volume_drop_threshold: 0.5
+    completeness_target: 0.99
+
+  evolution:
+    compatibility: backward
+    allow_unknown_fields_in_bronze: true

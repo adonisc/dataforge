@@ -1,0 +1,39 @@
+name: commerce_data_product
+version: "1.0.0"
+config-version: 2
+profile: dataforge
+
+# Where `dbt deps` installs packages. The container points this inside the image,
+# because the bind-mounted project would hide packages installed at build time.
+packages-install-path: "{{ env_var('DBT_PACKAGES_PATH', 'dbt_packages') }}"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+target-path: "target"
+
+# Materialisation per layer, so new models get the right default.
+models:
+  commerce_data_product:
+    +persist_docs:
+      relation: true
+      columns: true
+    staging:
+      # Views: staging is light renaming and casting, and views are always fresh.
+      +materialized: view
+      +schema: staging
+    marts:
+      # Tables: marts are read a lot, so compute them once per build.
+      +materialized: table
+      +schema: marts
+
+# Tests fail by default; individual tests can opt into warn.
+tests:
+  commerce_data_product:
+    +severity: error
+    +store_failures: true      # save failing rows to a table
+    +store_failures_as: table
+
+vars:
+  # Late-arrival window for incremental models. Keep it >= the contract's window.
+  late_arrival_window_days: 3

@@ -1,0 +1,130 @@
+apiVersion: dataforge/v1
+kind: DataContract
+
+metadata:
+  name: app_events
+  domain: product
+  owner: product-analytics@acme.example
+  upstream_system: "Kafka topic prod.app.events -> S3 sink connector (hourly rotation)"
+  description: >-
+    Clickstream / product events. Append-only and high volume. Exact-match dedupe only,
+    and looser quality limits than orders, since a few lost pageviews are acceptable.
+  version: 1.0.0
+  tags: [product, behavioural, tier-2, high-volume]
+
+spec:
+  source:
+    type: stream
+    mode: append
+    format: jsonl
+    uri: "app_events/dt={logical_date}/*.jsonl"
+    watermark_field: event_ts
+    late_arrival_window_days: 1
+    options:
+      # Saved in the manifest so replays can be bounded by offset.
+      track_offsets: true
+
+  targets:
+    bronze: bronze.app_events_raw
+    silver: silver.app_events
+    quarantine: quarantine.app_events
+
+  schema:
+    primary_key: [event_id]
+    dedupe_order_by: [event_ts]
+    fields:
+      - name: event_id
+        type: string
+        required: true
+        description: Producer-generated UUID; the idempotency key for at-least-once delivery.
+      - name: session_id
+        type: string
+        required: true
+      - name: customer_id
+        type: string
+        description: Null for anonymous sessions — the majority of traffic.
+      - name: event_name
+        type: string
+        required: true
+      - name: event_ts
+        type: timestamp
+        required: true
+      - name: event_date
+        type: date
+        required: true
+      - name: platform
+        type: string
+      - name: ip_address
+        type: string
+        classification: pii
+        masking: redact
+        description: >-
+          Redacted, not tokenised. A joinable IP adds GDPR risk with little value. Any
+          geo enrichment would happen before redaction.
+      - name: properties
+        type: json
+        description: >-
+          Free-form payload, kept as a JSON string because producers change it often.
+          Downstream models extract the keys they need.
+
+  quality:
+    # Looser than orders on purpose (see docs/03).
+    max_quarantine_rate: 0.05
+    rules:
+      - id: events_key_present
+        type: not_null
+        columns: [event_id, session_id, event_name, event_ts, event_date]
+        severity: quarantine
+
+      - id: events_id_unique
+        type: unique
+        columns: [event_id]
+        severity: quarantine
+        params:
+          order_by: [event_ts]
+        description: At-least-once delivery guarantees duplicates; this is routine, not an incident.
+
+      - id: events_ts_valid
+        type: timestamp_valid
+        columns: [event_ts]
+        severity: quarantine
+        params:
+          max_future_skew_minutes: 15
+          not_before: "2020-01-01T00:00:00"
+        description: >-
+          Device clocks can be wrong. Allow 15 minutes of skew, then quarantine. Not
+          blocking, so one bad device can't stop the pipeline.
+
+      - id: events_platform_known
+        type: accepted_values
+        columns: [platform]
+        severity: warn
+        params:
+          values: [web, ios, android, watch, tv]
+
+      - id: events_volume
+        type: row_count_anomaly
+        severity: warn
+        params:
+          min_rows: 0
+          drop_threshold: 0.4
+
+  partitioning:
+    column: event_date
+    granularity: day
+    # The two most-filtered columns. More keys add write cost without much benefit.
+    cluster_by: [event_name, platform]
+    target_file_size_mb: 512
+
+  retention:
+    # Raw events are the biggest data in the lake, so bronze is kept briefly. Silver keeps 2 years.
+    bronze_days: 14
+    silver_days: 730
+    quarantine_days: 14
+
+  slo:
+    freshness_minutes: 120
+    completeness_target: 0.98
+
+  evolution:
+    compatibility: backward

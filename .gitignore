@@ -1,0 +1,34 @@
+# Generated data, not source.
+data/lake/
+data/warehouse/
+data/_control/
+data/landing/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+transform/dbt/target/
+transform/dbt/dbt_packages/
+transform/dbt/logs/
+# Machine-specific dbt install id.
+transform/dbt/.user.yml
+
+# Never commit secrets.
+.env
+*.pem
+*.key
+
+.DS_Store
+.idea/
+.vscode/

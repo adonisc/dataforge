@@ -1,0 +1,42 @@
+version: 2
+
+# Grain tests on each staging model. Staging can add defects of its own (duplicate
+# keys from a union, a bad cast), and they're much easier to spot here than downstream.
+
+models:
+  - name: stg_orders
+    description: "Renamed and cast order headers. Grain: one row per order."
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+      - name: net_amount
+        description: gross - discount, computed once here so every consumer agrees.
+        data_tests: [not_null]
+
+  - name: stg_customers
+    description: >-
+      CDC change log. Grain: (customer_id, source_lsn) — one row per customer per
+      change, NOT one row per customer. dim_customer builds its SCD2 chain from it.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [customer_id, source_lsn]
+
+  - name: stg_fx_rates
+    description: >-
+      Daily reference rates to USD, with the USD identity row backfilled only where the
+      feed does not publish it. Grain: (rate_date, currency_code).
+    data_tests:
+      # Catches a duplicate USD rate here instead of as a MERGE error in fct_orders.
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [rate_date, currency_code]
+    columns:
+      - name: rate_to_usd
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range: { min_value: 0, inclusive: false }
+
+  - name: stg_app_events
+    description: "Product events. Grain: one row per event_id."
+    columns:
+      - name: event_id
+        data_tests: [unique, not_null]

@@ -1,0 +1,148 @@
+apiVersion: dataforge/v1
+kind: DataContract
+
+metadata:
+  name: customers
+  domain: commerce
+  owner: commerce-data@acme.example
+  upstream_system: "Debezium CDC from the operational Postgres (public.customers)"
+  description: >-
+    CDC feed for the customer master. Reads Debezium files landed in S3, not Kafka
+    directly (see docs/adr/ADR-0007). One row per customer per run, then merged into an
+    SCD2 dimension downstream.
+  version: 2.0.0
+  tags: [commerce, master-data, pii, tier-1]
+
+spec:
+  source:
+    type: database
+    mode: cdc
+    format: jsonl
+    uri: "customers_cdc/dt={logical_date}/*.jsonl"
+    cdc_op_field: op
+    cdc_sequence_field: source_lsn
+    watermark_field: source_ts
+    late_arrival_window_days: 7
+
+  targets:
+    bronze: bronze.customers_cdc_raw
+    silver: silver.customers
+    quarantine: quarantine.customers
+
+  schema:
+    primary_key: [customer_id]
+    dedupe_order_by: [source_lsn]
+    fields:
+      - name: customer_id
+        type: string
+        required: true
+      - name: email
+        type: string
+        classification: pii
+        masking: hash_hmac
+        description: Tokenised deterministically so it still joins to orders.customer_email_token.
+      - name: email_for_segmentation
+        type: string
+        classification: pii
+        masking: email_domain_only
+        description: >-
+          Same source column, but only the domain is kept. Useful for segmentation
+          (gmail vs corporate) without exposing anyone.
+      - name: full_name
+        type: string
+        classification: pii
+        masking: redact
+      - name: phone
+        type: string
+        classification: pii
+        masking: last4
+      - name: country_code
+        type: string
+        required: true
+      - name: customer_segment
+        type: string
+      - name: signup_ts
+        type: timestamp
+        required: true
+      - name: source_ts
+        type: timestamp
+        required: true
+        description: Commit timestamp at the source database; SCD2 effective dating uses this.
+      - name: source_lsn
+        type: long
+        required: true
+        description: Postgres LSN. The only safe ordering key for CDC — wall clocks are not monotonic.
+      - name: op
+        type: string
+        required: true
+        description: "Debezium operation: c=create, u=update, d=delete, r=snapshot read."
+
+  quality:
+    max_quarantine_rate: 0.01
+    rules:
+      - id: customers_key_present
+        type: not_null
+        columns: [customer_id, source_ts, source_lsn, op]
+        severity: blocking
+
+      - id: customers_pk_unique
+        type: unique
+        columns: [customer_id]
+        severity: blocking
+        params:
+          order_by: [source_lsn]
+        description: >-
+          Blocking, unlike orders. CDC is collapsed before validation, so a duplicate
+          here means the collapse or LSN ordering is broken.
+
+      - id: customers_op_known
+        type: accepted_values
+        columns: [op]
+        severity: blocking
+        params:
+          values: [c, u, d, r]
+        description: >-
+          Blocking: an unknown op likely means the connector changed, and a mishandled
+          delete can't be fixed in the dimension.
+
+      - id: customers_country_iso
+        type: regex
+        columns: [country_code]
+        severity: quarantine
+        params:
+          pattern: "[A-Z]{2}"
+
+      - id: customers_signup_valid
+        type: timestamp_valid
+        columns: [signup_ts, source_ts]
+        severity: quarantine
+        params:
+          max_future_skew_minutes: 5
+          not_before: "2010-01-01T00:00:00"
+
+      - id: customers_volume
+        type: row_count_anomaly
+        severity: warn
+        params:
+          min_rows: 0
+          drop_threshold: 0.2
+        description: >-
+          Warn, not block: a CDC feed can have quiet days, unlike a full extract.
+
+  partitioning:
+    granularity: day
+    cluster_by: [country_code]
+    target_file_size_mb: 128
+
+  retention:
+    bronze_days: 365
+    silver_days: 2555
+    quarantine_days: 90
+
+  slo:
+    freshness_minutes: 360
+    completeness_target: 0.995
+
+  evolution:
+    # FULL: read by old dashboards (backward) and by replays of old code (forward).
+    compatibility: full

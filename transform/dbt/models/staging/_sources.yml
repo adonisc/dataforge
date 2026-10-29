@@ -1,0 +1,96 @@
+version: 2
+
+sources:
+  - name: silver
+    description: >-
+      Validated, masked output of the dataforge pipeline. dbt starts here, not at the
+      raw landing zone.
+    # No `database:`, so each target uses its own (it differs per engine).
+    schema: silver
+
+    # Check source freshness before building, so stale data doesn't pass silently.
+    freshness:
+      warn_after: { count: 26, period: hour }
+      error_after: { count: 48, period: hour }
+    loaded_at_field: _ingested_at
+
+    tables:
+      - name: orders
+        description: One row per order, current state. Grain enforced by contract `orders` v1.2.0.
+        columns:
+          - name: order_id
+            description: Natural key from the OMS.
+            data_tests: [unique, not_null]
+          - name: customer_id
+            data_tests:
+              - not_null
+              # Warn only: a new customer can show up in orders before the CDC feed.
+              - relationships:
+                  to: source('silver', 'customers')
+                  field: customer_id
+                  config:
+                    severity: warn
+          - name: customer_email_token
+            description: >-
+              HMAC-SHA256 token, prefixed with the key version. Joinable to
+              customers.email_token. Not reversible. Never un-mask in a model.
+          - name: gross_amount
+            data_tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 0
+                  inclusive: true
+          - name: currency_code
+            data_tests: [not_null]
+          - name: order_date
+            data_tests: [not_null]
+          - name: _record_hash
+            description: Deterministic content hash; drives change detection downstream.
+
+      - name: customers
+        description: >-
+          CDC change log for the customer master, one row per customer per run.
+          `_is_deleted` marks tombstones.
+
+          GRAIN: (customer_id, source_lsn), not customer_id alone. Each run adds a row
+          per changed customer, and dim_customer needs that history to build its SCD2
+          chain, so customer_id is not unique here.
+        freshness:
+          warn_after: { count: 8, period: hour }
+          error_after: { count: 24, period: hour }
+        columns:
+          - name: customer_id
+            data_tests: [not_null]
+          - name: source_lsn
+            description: Postgres LSN. Orders the change log; part of the grain.
+            data_tests: [not_null]
+          - name: email_token
+            description: Joins to orders.customer_email_token under the same key version.
+          - name: country_code
+            data_tests: [not_null]
+          - name: _is_deleted
+            data_tests: [not_null]
+        data_tests:
+          - dbt_utils.unique_combination_of_columns:
+              combination_of_columns: [customer_id, source_lsn]
+
+      - name: app_events
+        description: Append-only product events. Tier 2 — looser guarantees by design.
+        freshness:
+          warn_after: { count: 3, period: hour }
+          error_after: { count: 12, period: hour }
+        columns:
+          - name: event_id
+            data_tests: [unique, not_null]
+          - name: event_date
+            data_tests: [not_null]
+
+      - name: fx_rates
+        description: Daily reference rates to USD. Tier 1 — every revenue figure passes through it.
+        columns:
+          - name: rate_to_usd
+            data_tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 0
+                  inclusive: false

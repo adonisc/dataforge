@@ -1,0 +1,200 @@
+# CI: runs on every pull request and on main.
+#
+# Cheap checks first so failures show up fast: lint, tests, image build, then deploys,
+# with a manual gate before prod.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  # One run per ref; a new push cancels the old run.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read        # least privilege; jobs ask for more if needed
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------- stage 1: lint ----
+  lint:
+    name: format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install ruff mypy types-PyYAML pydantic
+      - name: ruff format check
+        run: ruff format --check src tests scripts airflow
+      - name: ruff lint
+        run: ruff check src tests scripts airflow
+      - name: mypy (strict)
+        run: mypy
+
+      - name: secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------- stage 2: contract gates ----
+  contracts:
+    name: contract validation and compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # compatibility check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e ".[dev,duckdb]"
+
+      - name: every contract parses and every rule it declares exists
+        run: dataforge validate-contracts
+
+      - name: schema evolution gate
+        # Breaking schema changes need a major version bump.
+        
+        if: github.event_name == 'pull_request'
+        run: |
+          git worktree add /tmp/base origin/${{ github.base_ref }}
+          dataforge check-compatibility --base /tmp/base/contracts
+
+  # ----------------------------------------------------------- stage 3: unit tests ----
+  test:
+    name: unit and integration tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e ".[dev,duckdb,aws]"
+      - name: pytest
+        env:
+          DATAFORGE_MASKING_KEY: ci-only-key-not-a-secret
+        run: pytest --cov=dataforge --cov-report=term-missing --cov-report=xml
+      - name: coverage floor
+        # A floor to stop coverage slipping, not a target.
+        run: |
+          python -c "
+          import sys, xml.etree.ElementTree as ET
+          rate = float(ET.parse('coverage.xml').getroot().get('line-rate'))
+          print(f'line coverage: {rate:.1%}')
+          sys.exit(0 if rate >= 0.80 else 1)"
+
+  # ------------------------------------------------- stage 4: data quality in CI ------
+  data-quality:
+    name: pipeline smoke test and dbt build
+    runs-on: ubuntu-latest
+    needs: [test, contracts, cloud-integration]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e ".[dev,duckdb]" dbt-core dbt-duckdb
+
+      - name: generate synthetic fixtures
+        run: python scripts/generate_mock_data.py --date 2026-05-01 --days 3
+
+      - name: run the pipeline end to end
+        # Run the quality rules against fixtures.
+        env:
+          DATAFORGE_MASKING_KEY: ci-only-key-not-a-secret
+        run: |
+          for day in 2026-05-01 2026-05-02 2026-05-03; do
+            for ds in orders customers app_events; do
+              dataforge ingest "$ds" --logical-date "$day"
+            done
+          done
+
+      - name: dbt build (models and their tests, interleaved)
+        working-directory: transform/dbt
+        run: |
+          dbt deps
+          dbt build --target test --fail-fast
+
+      - name: dbt docs
+        working-directory: transform/dbt
+        run: dbt docs generate --target test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dbt-docs
+          path: transform/dbt/target/
+
+  # --------------------------------------------------------- stage 5: build/package ---
+  build:
+    name: build and scan image
+    runs-on: ubuntu-latest
+    needs: [data-quality]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write          # OIDC, no long-lived credentials
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: airflow/Dockerfile
+          tags: ghcr.io/${{ github.repository }}/airflow:${{ github.sha }}
+          push: ${{ github.ref == 'refs/heads/main' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}/airflow:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"           # a critical CVE blocks promotion
+
+  # --------------------------------------------------------- stage 6: deploy dev ------
+  deploy-dev:
+    name: deploy to dev
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [build]
+    environment: dev             # deploys automatically
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: point the dev DAG bundle at this commit
+        run: echo "would set the dev Git DAG bundle ref to ${{ github.sha }}"
+
+  # ------------------------------------------- stage 7: controlled gate to prod -------
+  deploy-prod:
+    name: promote to prod
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: assume the deployment role via OIDC
+        run: echo "would exchange the OIDC token for a short-lived deployment role"
+      - name: promote the DAG bundle
+        run: echo "would move the prod Git DAG bundle to ${{ github.sha }}"
+      - name: post-deploy verification
+        run: echo "would trigger a canary run and assert freshness before declaring success"
