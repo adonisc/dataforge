@@ -1,0 +1,3 @@
+# Minimum versions for security fixes not yet in Airflow's constraints.
+certifi>=2026.10.18
+uv>=0.13.4

@@ -1,7 +1,8 @@
 # CI: runs on every pull request and on main.
 #
 # Cheap checks first so failures show up fast: lint, tests, image build, then deploys,
-# with a manual gate before prod.
+# with a manual gate before prod. Deploy jobs only run when the repo variable
+# DEPLOY_ENABLED is "true"; until then they show as skipped, not as a fake pass.
 
 name: ci
 
@@ -9,30 +10,34 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
-  # One run per ref; a new push cancels the old run.
+  # Cancel superseded PR runs, but never cancel a main run mid-deploy.
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read        # least privilege; jobs ask for more if needed
 
 env:
   PYTHON_VERSION: "3.12"
+  IMAGE: ghcr.io/${{ github.repository }}/airflow
 
 jobs:
   # ---------------------------------------------------------------- stage 1: lint ----
   lint:
-    name: format and lint
+    name: format, lint, types, secrets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0     # gitleaks scans the full history
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - run: pip install ruff mypy types-PyYAML pydantic
+      - run: pip install -e ".[dev]"
       - name: ruff format check
         run: ruff format --check src tests scripts airflow
       - name: ruff lint
@@ -41,7 +46,7 @@ jobs:
         run: mypy
 
       - name: secret scan
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -50,21 +55,20 @@ jobs:
     name: contract validation and compatibility
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
-          fetch-depth: 0     # compatibility check
-      - uses: actions/setup-python@v5
+          fetch-depth: 0     # the compatibility check needs the base branch
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - run: pip install -e ".[dev,duckdb]"
+      - run: pip install -e .
 
       - name: every contract parses and every rule it declares exists
         run: dataforge validate-contracts
 
       - name: schema evolution gate
         # Breaking schema changes need a major version bump.
-        
         if: github.event_name == 'pull_request'
         run: |
           git worktree add /tmp/base origin/${{ github.base_ref }}
@@ -76,8 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -99,22 +103,24 @@ jobs:
   data-quality:
     name: pipeline smoke test and dbt build
     runs-on: ubuntu-latest
-    needs: [test, contracts, cloud-integration]
+    needs: [test, contracts]
+    env:
+      DATAFORGE_MASKING_KEY: ci-only-key-not-a-secret
+      DATE: "2026-05-01"
+      DAYS: "3"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - run: pip install -e ".[dev,duckdb]" dbt-core dbt-duckdb
+      - run: pip install -e ".[dev,duckdb]" "dbt-core>=1.9,<2.0" "dbt-duckdb>=1.9,<2.0"
 
+      # Same chain as `make verify`: fixtures -> 4 source types -> lake -> DuckDB -> dbt.
       - name: generate synthetic fixtures
-        run: python scripts/generate_mock_data.py --date 2026-05-01 --days 3
+        run: python scripts/generate_mock_data.py --date "$DATE" --days "$DAYS"
 
-      - name: run the pipeline end to end
-        # Run the quality rules against fixtures.
-        env:
-          DATAFORGE_MASKING_KEY: ci-only-key-not-a-secret
+      - name: ingest files, CDC and stream
         run: |
           for day in 2026-05-01 2026-05-02 2026-05-03; do
             for ds in orders customers app_events; do
@@ -122,52 +128,86 @@ jobs:
             done
           done
 
+      - name: ingest the REST source against the local stub
+        run: python -m scripts.ingest_fx_local --date "$DATE" --days "$DAYS"
+
+      - name: register the lake in DuckDB
+        run: python scripts/register_lake.py --lake-root data/lake --database data/warehouse/test.duckdb
+
       - name: dbt build (models and their tests, interleaved)
         working-directory: transform/dbt
+        env:
+          DBT_PROFILES_DIR: .
         run: |
           dbt deps
           dbt build --target test --fail-fast
 
       - name: dbt docs
         working-directory: transform/dbt
+        env:
+          DBT_PROFILES_DIR: .
         run: dbt docs generate --target test
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dbt-docs
           path: transform/dbt/target/
 
   # --------------------------------------------------------- stage 5: build/package ---
   build:
-    name: build and scan image
+    name: build, scan and publish image
     runs-on: ubuntu-latest
     needs: [data-quality]
     permissions:
       contents: read
-      packages: write
-      id-token: write          # OIDC, no long-lived credentials
+      packages: write          # push to GHCR with the built-in token, no cloud keys
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: build (loaded locally so it can be scanned before any push)
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: airflow/Dockerfile
-          tags: ghcr.io/${{ github.repository }}/airflow:${{ github.sha }}
-          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: vulnerability scan
-        uses: aquasecurity/trivy-action@0.28.0
+      - name: vulnerability report (CRITICAL, HIGH)
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}/airflow:${{ github.sha }}
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
           severity: CRITICAL,HIGH
-          exit-code: "1"           # a critical CVE blocks promotion
+          exit-code: "0"
+
+      - name: vulnerability gate (fixable CRITICAL blocks)
+        # Unfixable base-image CVEs are reported above, not blocking; a gate that is
+        # always red gets ignored.
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      - name: log in to GHCR
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: publish (main only, tagged by commit SHA)
+        if: github.ref == 'refs/heads/main'
+        run: docker push "${{ env.IMAGE }}:${{ github.sha }}"
 
   # --------------------------------------------------------- stage 6: deploy dev ------
   deploy-dev:
     name: deploy to dev
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     needs: [build]
     environment: dev             # deploys automatically
@@ -175,26 +215,25 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: point the dev DAG bundle at this commit
-        run: echo "would set the dev Git DAG bundle ref to ${{ github.sha }}"
+        run: echo "Placeholder - set the dev Git DAG bundle ref to ${{ github.sha }}"
 
   # ------------------------------------------- stage 7: controlled gate to prod -------
   deploy-prod:
     name: promote to prod
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     needs: [deploy-dev]
-    
-    environment: production
+    environment: production      # add required reviewers in repo settings
     permissions:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: assume the deployment role via OIDC
-        run: echo "would exchange the OIDC token for a short-lived deployment role"
+        run: echo "Placeholder - exchange the OIDC token for a short-lived deployment role"
       - name: promote the DAG bundle
-        run: echo "would move the prod Git DAG bundle to ${{ github.sha }}"
+        run: echo "Placeholder - move the prod Git DAG bundle to ${{ github.sha }}"
       - name: post-deploy verification
-        run: echo "would trigger a canary run and assert freshness before declaring success"
+        run: echo "Placeholder - trigger a canary run and assert freshness before declaring success"

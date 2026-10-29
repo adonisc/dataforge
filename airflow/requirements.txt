@@ -1,11 +1,10 @@
-# Airflow providers and transformation tooling for the worker image.
+# Airflow providers and runtime libraries, installed with Airflow's constraints.
+# dbt lives in its own venv (requirements-dbt.txt).
+apache-airflow-providers-standard>=1.0.0
 apache-airflow-providers-amazon>=9.0.0
 apache-airflow-providers-postgres>=6.0.0
 apache-airflow-providers-openlineage>=2.0.0
 apache-airflow-providers-common-messaging>=1.0.0
-
-dbt-core>=1.9,<2.0
-dbt-duckdb>=1.9,<2.0
 
 pydantic>=2.7
 PyYAML>=6.0

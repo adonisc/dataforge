@@ -60,7 +60,7 @@ seed: ## Generate synthetic source data (in Docker)
 
 pipeline: seed ## Run the ingestion pipeline for all four source types (in Docker)
 	$(TOOLS) 'for d in $$(python -c "import datetime as t;s=t.date.fromisoformat(\"$(DATE)\");print(\" \".join(str(s+t.timedelta(days=i)) for i in range($(DAYS))))"); do for ds in orders customers app_events; do dataforge ingest $$ds --logical-date $$d || exit 1; done; done'
-	$(TOOLS) "python scripts/ingest_fx_local.py --date $(DATE) --days $(DAYS)"
+	$(TOOLS) "python -m scripts.ingest_fx_local --date $(DATE) --days $(DAYS)"
 
 warehouse-docker: ## Expose the lake to DuckDB so dbt can read it (in Docker)
 	$(TOOLS) "python scripts/register_lake.py --lake-root /work/data/lake --database /work/data/warehouse/dev.duckdb"
@@ -121,7 +121,7 @@ demo: data ## Run the whole pipeline locally over synthetic data (all 4 source t
 	@echo "done. lake: data/lake  manifests: data/_control/state.json  lineage: data/_control/lineage.jsonl"
 
 demo-fx: ## Ingest fx_rates against a local stub of the Treasury API
-	@$(PY) scripts/ingest_fx_local.py --date $(DATE) --days $(DAYS)
+	@$(PY) -m scripts.ingest_fx_local --date $(DATE) --days $(DAYS)
 
 demo-fail: ## Demonstrate the blocking quality gate (expected to exit 2)
 	@mkdir -p data/landing/orders/dt=2030-01-01

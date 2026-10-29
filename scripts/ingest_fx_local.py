@@ -4,7 +4,7 @@
 Starts the stub, points the source URI at it via an env override, and runs the normal
 pipeline for each date. Only the address differs from production.
 
-    python scripts/ingest_fx_local.py --date 2026-05-01 --days 3
+    python -m scripts.ingest_fx_local --date 2026-05-01 --days 3
 """
 
 from __future__ import annotations
